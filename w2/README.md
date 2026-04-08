@@ -46,7 +46,7 @@
    - 使用命令：在目標機使用 `ss -tlnp | grep :22` 檢查服務狀態，或從來源機使用 `nc -zv <目標 IP> 22` 測試埠口是否開放。
 
 ## 網路拓樸圖
-![](./network-diagram.png)
+![](./network-diagram.png) 
 
 ## 排錯紀錄
 - 症狀：從 `dev-a` 無法透過 SSH 連線至 `server-b`，錯誤訊息顯示為 `Connection refused`。
