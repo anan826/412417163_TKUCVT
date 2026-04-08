@@ -11,14 +11,23 @@
 ## 連線驗證紀錄
 
 - [x] dev-a NAT 可上網：`ping google.com` 輸出
+
 ![](./images/ping_google.png)
+
 - [x] 雙向互 ping 成功：貼上雙方 `ping` 輸出
+
 ![](./images/ping_both.png)
+
 - [x] SSH 連線成功：`ssh <user>@<ip> "hostname"` 輸出
+
 ![](./images/ssh_success.png)
+
 - [x] SCP 傳檔成功：`cat /tmp/test-from-dev.txt` 在 server-b 上的輸出
+
 ![](./images/scp_success.png)
+
 - [x] server-b 不能上網：`ping 8.8.8.8` 失敗輸出
+
 ![](./images/ping_failed.png)
 
 ## 故障演練一：介面停用
