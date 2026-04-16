@@ -76,7 +76,35 @@ Connection refused（拒絕連線）
 對方有回應，但明確告訴你「這個門沒開」，TCP 回了一個 RST 封包。代表網路層是通的（ping 會成功），但目標 port 上沒有任何服務在監聽。排錯方向要往 L4（服務層） 查：去目標機上看 ss -tlnp | grep :22，確認 SSH daemon 有沒有在跑、systemctl status ssh 是否 active。
 
 ## 網路拓樸圖
-（嵌入或連結 network-diagram）
+```mermaid
+    graph TD
+    subgraph External_World [外部區域 / Host OS]
+        User((管理員終端))
+    end
+
+    subgraph DMZ_Zone [跳板管理區 DMZ]
+        Bastion[Bastion 跳板機<br/><br/>NIC 1: 192.168.192.129<br/>NIC 2: 192.168.163.128]
+    end
+
+    subgraph Private_Network [私有內網192.168.163.0/24]
+        
+        style Space1 fill:none,stroke:none
+        
+        App[App 伺服器<br/><br/>IP: 192.168.163.129]
+        DB[DB 伺服器<br/><br/>IP: 192.168.163.130]
+    end
+
+    %% 連線路徑
+    User -- "SSH (Port 22)" --> Bastion
+    Bastion -- "ProxyJump  " --> App
+    Bastion -- "ProxyJump  " --> DB
+    App -- "Database Query  " --> DB
+
+    %% 配色
+    style Bastion fill:#f96,stroke:#333
+    style App fill:#bbf,stroke:#333
+    style DB fill:#dfd,stroke:#333
+```
 
 ## 排錯紀錄
 - 症狀：
