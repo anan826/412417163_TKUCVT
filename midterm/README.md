@@ -177,6 +177,7 @@ systemctl status docker
 ```
 
 **預期輸出（請貼實際結果）：**
+
 ![Docker daemon running](./screenshots/docker-running.png)
 
 **截圖**：`screenshots/docker_ps_.png`
