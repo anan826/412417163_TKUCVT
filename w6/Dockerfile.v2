@@ -1,0 +1,12 @@
+FROM python:3.12-slim
+WORKDIR /app
+
+# 先複製相依清單，單獨裝套件（這層只在 requirements 變動時才 rebuild）
+COPY app/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 再複製應用程式碼（這層才是常常變動的）
+COPY app/ .
+
+EXPOSE 80
+CMD ["python", "app.py"]

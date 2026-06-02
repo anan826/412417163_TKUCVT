@@ -1,128 +1,113 @@
-# W07｜Docker Compose 與資料持久化
+# W06｜Docker Image 與 Dockerfile
 
 > 環境：Windows + VMware 上的 Ubuntu 22.04 VM（app VM，W03 建立）
-> `docker --version` → 24.0.7｜`docker compose version` → v2.21.0
+> `docker --version` → Docker version 24.0.7, build afdd53b｜BuildKit 已啟用
 
 ---
 
-## 拓樸圖
+## 映像組成
 
-本週 `docker compose up -d` 起來之後，Docker Engine 上實際存在的東西：
-
-```mermaid
-flowchart TB
-    subgraph NET["w07_default（Compose 自動建的 bridge 網路）"]
-        APP["容器 app\nbuild: ./app\n0.0.0.0:8080 -> 80"]
-        DB["容器 db\nimage: postgres:16\n聽 5432（不對外）"]
-    end
-    VOL[("named volume\nw07_db-data\n/var/lib/postgresql/data")]
-    HOST["host: curl localhost:8080"]
-
-    HOST -->|8080->80| APP
-    APP -->|DNS: db -> 容器 IP\nport 5432| DB
-    DB -.掛載.- VOL
-
-    style NET fill:#dbeafe,stroke:#333
-    style VOL fill:#d1fae5,stroke:#333
-    style HOST fill:#fef3c7,stroke:#333
-```
-
-重點三件事：`app` 與 `db` 都接在 Compose 自動建的 `w07_default` 上、`app` 用 service name `db` 當 DNS、`db` 的資料寫在 named volume `w07_db-data`（活過容器重建）。
+- **Layers 是什麼**：image 的「檔案內容」本體。每一層是一包唯讀的 tarball，記錄相對於上一層的檔案系統差異（新增/修改/刪除）。`FROM`、`RUN`、`COPY`、`ADD` 各會疊一層。容器跑起來時，這些唯讀層被 overlay2 疊成 lower，再加一層可寫的 upper（就是 W05 的 merged view）。同一個 base 的層在多個 image 之間共用，所以 pull 才會看到 `Already exists`。
+- **Config 是什麼**：一份 JSON，存的是「怎麼跑」的 metadata，而不是檔案內容——`Cmd`、`Entrypoint`、`Env`、`WorkingDir`、`ExposedPorts`、`User` 等。`WORKDIR`、`ENV`、`USER`、`CMD`、`ENTRYPOINT` 改的就是這份 config。
+- **Manifest 是什麼**：把上面兩者綁在一起的索引。它列出 config 的 digest，以及每一層的 digest 與大小，registry 靠它知道一個 image 由哪些 blob 組成、要不要下載。
 
 ---
 
-## 從 docker run 到 compose.yaml
+## python:3.12-slim inspect 摘錄
 
-最有感的改善是**「網路與順序不用我自己記」**。
+`docker image inspect python:3.12-slim` 的關鍵欄位：
 
-期中那套要先 `docker network create lab-net`、再 `docker volume create`、再兩條 `docker run` 排好順序，漏一條學弟就炸（network not found / connection refused）。改成 Compose 後，這些變成 yaml 裡的 `networks`(自動)、`volumes`、`depends_on` 三個宣告，我只描述「我要的最終狀態」，剩下交給 `docker compose up -d` 一次到位。重現部署從「照筆記重抄五條指令」變成 `git clone` + `docker compose up -d` 兩句話，密碼也集中到 `.env` 一處而不是散在四個 `-e` 裡。
-
-簡單講：Compose 把命令式的「步驟清單」換成宣告式的「狀態描述」，順序、網路、清現場都自動化了。
-
----
-
-## 三種掛載對照
-
-| 掛載類型 | 路徑（host） | 容器砍重起資料還在嗎 | 重啟容器資料狀態 | 適合情境 |
-|---|---|---|---|---|
-| named volume | `/var/lib/docker/volumes/w07_db-data/_data`（Docker 管，勿手動改） | 在（除非 `docker compose down -v` 或 `docker volume rm`） | 保留 | 生產環境的資料庫資料、需可攜性 |
-| bind mount | `./app`（專案目錄，可用編輯器直接改） | 在（host 目錄還在就在） | 保留，且 host↔容器 雙向同步 | 開發中的 source code 即時改 |
-| tmpfs | 記憶體（host 完全不落地） | **不在** | **清空** | 敏感暫存（密鑰）、超快 cache |
-
-實測佐證：
-- `docker compose down`（不帶 `-v`）→ `up -d` 後 `SELECT * FROM notes;` 資料**還在**（步驟 11）。
-- `docker compose down -v` → `up -d` 後資料**消失**，出現 `relation "notes" does not exist`（步驟 12）。
-- tmpfs 寫入 `/tmp/cache/x` 後 `docker compose restart app`，`ls /tmp/cache` 為空（步驟 15）。
+- **Config.Cmd**：`["python3"]`
+- **Config.Env**：
+  ```
+  PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  LANG=C.UTF-8
+  GPG_KEY=7169605F62C751356D054A26A821E680E5FA6305
+  PYTHON_VERSION=3.12.7
+  PYTHON_SHA256=24887b92e2afd4a2ac602419ad4b596372f67ac9b077190f459aba390faf5550
+  ```
+- **Config.WorkingDir**：`""`（空字串，base image 沒設）
+- **RootFS.Layers 數量**：4 層
 
 ---
 
-## healthcheck 前後對照
+## Layer 快取實驗
 
-> 測試方式：`db.command` 故意加 `sleep 8` 模擬 db init 慢，重啟後每秒打一次 `/healthz`。
+| 情境 | build 時間 |
+|---|---|
+| v1 首次 build | 41.2s |
+| v1 改 app.py 後 rebuild | 38.7s |
+| v2 首次 build | 40.5s |
+| v2 改 app.py 後 rebuild | 1.9s |
 
-| 寫法 | curl /healthz t=1s | t=3s | t=5s | t=10s |
-|---|---|---|---|---|
-| 只 `depends_on: [db]` | 503 | 503 | 503 | 200 |
-| `condition: service_healthy` | refused | refused | refused | 200 |
+觀察：v2 的 rebuild 快，是因為 `COPY app/requirements.txt .` 跟 `RUN pip install` 被排在「改 code 不會動到的位置」。改 `app.py` 只讓最後的 `COPY app/ .` 那層的 cache key 變動，前面那兩層的 cache key 完全沒變、直接命中快取，所以 pip install 一秒都不跑。v1 之所以慢，是因為 `COPY app/ .` 排在 pip install **前面**，而 `app.py` 屬於 `app/` 的一部分——這層一 miss，後面所有層（含 pip install）的 cache key 都連帶失效，整串重算。這正是「某層 miss 則其後全 miss」的代價。
 
-觀察（自己的話）：
+---
 
-兩者最後都會 200，但「過程」完全不同，這正是重點。只寫 `depends_on` 時，app 容器很早就起來開始 listen（所以打得通、不是 refused），但它連 db 失敗，於是回 503——也就是**對外宣稱自己活著、其實不能用**。加上 `service_healthy` 後，app 根本不會在 db ready 前啟動，所以前幾秒是 connection refused（沒有東西在 listen），可是**只要 app 一起來就直接 200，永遠不會出現「假活著」的 503**。對上游或 LB 來說，refused 比 503 誠實——它知道這台還沒準備好、不會把流量導進來。
+## CMD vs ENTRYPOINT 實驗
 
-`start_period` 的用途：db 在初始化那段時間 `pg_isready` 本來就會失敗，`start_period: 5s` 讓這段「預期中的失敗」不計入 `retries`，避免 db 還在開機就被判 unhealthy。
+| 寫法 | `docker run <img>` 輸出 | `docker run <img> extra1 extra2` 輸出 |
+|---|---|---|
+| CMD shell form | `argv = ['show_args.py', 'default1', 'default2']`；`PID = 7` | 忽略預設、執行 `/bin/sh -c extra1 extra2`，`sh: 1: extra1: not found`（exit 127） |
+| CMD exec form | `argv = ['show_args.py', 'default1', 'default2']`；`PID = 1` | 整條 CMD 被覆蓋成 `extra1 extra2`，`docker: Error response... exec: "extra1": executable file not found in $PATH` |
+| ENTRYPOINT + CMD | `argv = ['show_args.py', 'default1', 'default2']`；`PID = 1` | `argv = ['show_args.py', 'extra1', 'extra2']`；`PID = 1`（完美附加） |
+
+結論：`ENTRYPOINT + CMD` 最穩，原因有二。第一，**參數行為符合直覺**：ENTRYPOINT 固定主程式（`python show_args.py`），`docker run` 後面接的東西只覆蓋 CMD 那段、變成附加參數，不會像純 CMD 那樣把整條命令吃掉。第二，**訊號處理正確**：exec form 讓 PID 1 就是 python 本身（上表 PID=1），容器收得到 `docker stop` 送的 SIGTERM 能 graceful shutdown；shell form 的 PID 1 是 `/bin/sh`，python 是它 fork 出來的子程序，SIGTERM 被 sh 吃掉、python 收不到，`docker stop` 會等滿 10 秒才 SIGKILL 強制殺。
+
+---
+
+## Multi-stage 大小對照
+
+| Image | SIZE |
+|---|---|
+| python:3.12（builder base） | 1.02 GB |
+| python:3.12-slim（runtime base） | 130 MB |
+| myapp:v2（單階段） | 147 MB |
+| myapp:multi（多階段） | 142 MB |
+
+解釋：builder stage 那層用的是完整版 `python:3.12`（含 gcc、build-essential、各種 -dev header，整整 1 GB），但它的 layers **不會**進最終 image——最終 image 只疊 runtime stage（`python:3.12-slim`）的層，加上從 builder `COPY --from` 搬過來的 site-packages。所以 multi 比 v2 還略小一點（v2 在 slim 上跑 `pip install` 會留下 pip 的 cache/metadata 殘渣，multi 只搬乾淨的套件檔）。但那些 builder 層沒有真的消失：`docker images -a` 會看到 `<none>` 的中間 image，它們留在本機 build cache 裡下次可重用；只是 `docker push` 時不會被推上 registry。這就是 multi-stage「最終產物瘦、本機快取不瘦」的特性。flask 這種純 Python 套件差距不大，但若 app 要編譯 C extension（numpy、psycopg2 之類），差距會從幾 MB 拉到數百 MB。
+
+---
+
+## .dockerignore 故障注入
+
+| 項目 | 故障前 | 故障中 | 回復後 |
+|---|---|---|---|
+| du -sh . | 88K | 151M | 152M（檔案還在本機，但被 ignore 排除） |
+| build context 傳輸大小 | 6.14kB | 157.30MB | 4.81kB |
+| build 時間 | 1.8s | 7.6s | 1.7s |
+
+說明：故障中 `du` 與「故障前」差 150M，是因為注入了 100M 的假 `.git/objects/big.pack` 與 50M 的 `logs/huge.log`。注意「回復後」的 `du -sh .` 依然是 150M+（檔案實體還在硬碟上），但 build 的 `transferring context` 掉回 4.81kB——這證明 `.dockerignore` 是在「傳 context 給 daemon」這一步就把它們濾掉，垃圾根本沒被送進 build。
 
 ---
 
 ## 排錯紀錄
 
-- **症狀**：把 `services.db` 改名成 `database:` 後（步驟 9），`curl /healthz` 一直回 503。
-- **診斷**：`docker compose logs app --tail=10` 看到 `could not translate host name "db" to address`。app 的環境變數 `DB_HOST` 還寫 `db`，但 service 已改名 `database`，Compose 內建 DNS（127.0.0.11）查不到 `db` 這個名字 → 解析失敗 → 連線失敗 → `/healthz` 回 503。確認這是 DNS 問題而非網路不通：`docker compose exec app sh -c "getent hosts database"` 查得到、`getent hosts db` 查不到。
-- **修正**：把 `compose.yaml` 的 `database:` 改回 `db:`（保持與 `DB_HOST: db` 一致），`docker compose up -d`。
-- **驗證**：`docker compose exec app sh -c "getent hosts db"` 印出 172.x 容器 IP；`curl http://localhost:8080/healthz` 回 `ok`（200）。
+- **症狀**：把 `Dockerfile.multi` 設成最終 `Dockerfile` 並 build 後，`docker run myapp:multi`（不接 `app.py`）容器秒退，`docker logs` 顯示 `python: can't open file '//app.py': [Errno 2] No such file or directory`。
+- **診斷**：最終版用 `ENTRYPOINT ["python"]` + `CMD ["app.py"]`，正常情況下兩者組合成 `python app.py`。但我 `docker run` 時手賤多打了一個自訂參數，把 CMD 的 `app.py` 覆蓋掉了，於是變成只執行 `python`（無檔名）→ 進 REPL 又無 TTY → 退出；而教材步驟 25 的 `docker run ... myapp:multi app.py` 是「故意重新指定 CMD」，剛好補回 `app.py`，所以那條能跑。換句話說，問題不在 image 而在我 run 的方式。另外確認 `WORKDIR /app` 生效、`app.py` 確實在 `/app` 下（`docker run --rm --entrypoint ls myapp:multi -l /app` 看得到）。
+- **修正**：直接 `docker run -d --name myapp-multi -p 8081:80 -e APP_VERSION=multi myapp:multi`（不接任何參數，讓 CMD 的 `app.py` 生效）。
+- **驗證**：`curl http://localhost:8081/` 回 `Hello from <id> | version=multi`；`docker exec myapp-multi whoami` 回 `appuser`（確認非 root 也正常）。
 
 ---
 
 ## 設計決策
 
-**為什麼 db 用 named volume 而不是 bind mount？**
+**為什麼 runtime 選 `python:3.12-slim` 而不是 `alpine`？**
 
-三個理由。第一，**權限/相容性**：bind mount 直接把 host 的 uid/gid 帶進容器，postgres 對 data 目錄的 owner、locale、（在有 SELinux 的系統上）label 很挑剔，bind mount 很容易 permission denied 或啟動失敗；named volume 由 Docker 初始化權限，postgres 拿到的就是它期望的環境。第二，**可攜性**：named volume 不綁特定 host 路徑，換機器只要 volume 在就能接；bind mount 綁死 `./app` 這種相對/絕對路徑，換環境就斷。第三，**抽象邊界**：我不該、也不需要知道 postgres 怎麼擺檔案，那是它的內部實作，交給 Docker 管比我自己用 vim 去 `/var/lib/docker/volumes/` 戳安全得多（postgres 跑的時候那個目錄是 mmap 進記憶體的，手改會壞）。
+slim 用的是 glibc，跟 PyPI 上絕大多數預編譯的 manylinux wheel 相容——`pip install flask`（甚至 numpy、pandas）能直接抓二進位 wheel，不用在容器裡編譯。alpine 用的是 musl libc，many wheel 不相容，pip 常常會 fallback 去「從原始碼編譯」，這時又得 `apk add gcc musl-dev python3-dev`，不但拖慢 build，還可能踩到 musl 與某些套件的相容性坑。對這個 hello world app，alpine 確實能再小個幾十 MB，但換來的是 build 變慢、相容風險上升，划不來；對有 C extension 的 app 更是直接勸退。slim 已經比完整版小了快 8 倍（130MB vs 1GB），同時保住 glibc 生態相容性，是這個情境下「小」與「穩」的最佳平衡點。
 
-**為什麼不能在生產用 tmpfs 存資料庫？**
+**為什麼最終 `Dockerfile` 用 multi-stage 而非單階段 v2？**
 
-tmpfs 在記憶體、容器一停就清空、host 完全不落地——這正是資料庫**最不能接受**的特性。資料庫的本質是持久化，tmpfs 等於每次重啟就清庫；而且記憶體有限，整個 DB 塞進 RAM 也不現實。tmpfs 的正確用途是「本來就該即用即丟」的東西，例如不想落地的密鑰或超快的暫存 cache。
-
-**TLS（app↔db 加密）該寫在哪？（想一想 Q4 的判斷）**
-
-我的判斷：**憑證掛載走 Compose、是否啟用 TLS 走 app/db 自己的設定**。Compose 適合做的是「把 cert/key 檔送進容器」（用 volume 或 secrets）和「設環境變數」，但「要不要強制 TLS、用哪個 cipher」是 postgres（`ssl=on`、`pg_hba.conf` 的 `hostssl`）和 client（psycopg2 的 `sslmode=verify-full`）的職責。Compose 只是把材料就定位，加密握手本身屬於應用層，不該、也沒辦法塞進 yaml。
+編譯工具只在 build 時需要、runtime 用不到。multi-stage 把 `python:3.12`（含編譯器）關在 builder stage，最終 image 只留 slim runtime + 乾淨套件，既縮小了體積、也縮小了攻擊面（runtime 沒有 gcc，攻擊者進來也較難就地編譯東西）。再加 `USER appuser` 降權，是 W12 安全要求的提前鋪路。
 
 ---
 
 ## 可重跑最小命令鏈
 
 ```bash
-cd ~/virt-container-labs/w07
-cp .env.example .env        # 自己改密碼
-docker compose up -d
-sleep 10
-curl http://localhost:8080/healthz   # 預期 ok
-curl http://localhost:8080/          # 預期 Hello from <id> | db time = ...
+cd ~/virt-container-labs/w06
+docker build -f Dockerfile.multi -t myapp:multi .
+docker run -d --name myapp-final -p 8080:80 -e APP_VERSION=final myapp:multi app.py
+curl http://localhost:8080/
+docker stop myapp-final && docker rm myapp-final
 ```
-
----
-
-## 常用指令速查
-
-```bash
-docker compose up -d          # 起所有 service（背景）
-docker compose down           # 停 + 砍容器與網路（保留 volume）
-docker compose down -v        # 停 + 砍容器、網路、named volume（資料會消失）
-docker compose ps             # 狀態總覽
-docker compose logs -f app    # 追 app 的 log
-docker compose config         # 預覽展開 .env 後的最終 yaml
-docker compose up -d --build  # 改了 Dockerfile，強制重 build 再起
-docker compose exec db psql -U postgres -d labdb
-```
-
-> `down` vs `down -v`：前者保留 named volume（資料還在），後者連 volume 一起砍（資料消失）。
-> `restart` vs `up -d`：`restart` 只停再開、**不重讀 yaml/不重 build**；`up -d` 會 diff yaml 並只重建變動的 service。
